@@ -11,6 +11,7 @@
 #include "graph.h"
 #include "pvector.h"
 
+typedef CSRGraph<NodeID> Network;
 
 /*
 GAP Benchmark Suite
@@ -32,7 +33,7 @@ using namespace std;
 typedef float ScoreT;
 const float kDamp = 0.85;
 
-pvector<ScoreT> PageRankPull(const Graph &g, int max_iters,
+pvector<ScoreT> PageRankPullOld(const Network &g, int max_iters,
                              double epsilon = 0) {
   const ScoreT init_score = 1.0f / g.num_nodes();
   const ScoreT base_score = (1.0f - kDamp) / g.num_nodes();
@@ -59,8 +60,45 @@ pvector<ScoreT> PageRankPull(const Graph &g, int max_iters,
   return scores;
 }
 
+/* Sequential SpMV implementation of Pagerank */
+pvector<ScoreT> PageRankPull(const Network &g, int max_iters,
+                             double epsilon = 0) {
+  const ScoreT init_score = 1.0f / g.num_nodes();
+  const ScoreT base_score = (1.0f - kDamp) / g.num_nodes();
+  pvector<ScoreT> r(g.num_nodes(), init_score);
+  vector<vector<float>> L(g.num_nodes(), vector<float>(g.num_nodes(), 0));
 
-void PrintTopScores(const Graph &g, const pvector<ScoreT> &scores) {
+  for (int64_t i = 0; i < g.num_nodes(); i++) {
+    for (int64_t j = 0; j < g.num_nodes(); j++){
+      L[i][j] = 1.0f / g.out_degree(j);
+    }
+  }
+
+  for (int iter=0; iter < max_iters; iter++) {
+    double error = 0;
+    pvector<ScoreT> temp(g.num_nodes(), 0);
+    for(int64_t i = 0; i < g.num_nodes(); i++) {
+      temp[i] = 0;
+      for(auto j : g.in_neigh(i)) {
+        temp[i] += (r[j]* L[i][j]);
+      }
+      temp[i] = kDamp * temp[i] + base_score;
+      error += fabs(temp[i] - r[i]);
+    }
+
+    printf(" %2d    %lf\n", iter, error);
+
+    for(int64_t i = 0; i < g.num_nodes(); i++) {
+      r[i] = temp[i];
+    }
+    if (error < epsilon)
+      break;
+  }
+  return r;
+}
+
+
+void PrintTopScores(const Network &g, const pvector<ScoreT> &scores) {
   vector<pair<NodeID, ScoreT>> score_pairs(g.num_nodes());
   for (NodeID n=0; n < g.num_nodes(); n++) {
     score_pairs[n] = make_pair(n, scores[n]);
@@ -75,7 +113,7 @@ void PrintTopScores(const Graph &g, const pvector<ScoreT> &scores) {
 
 // Verifies by asserting a single serial iteration in push direction has
 //   error < target_error
-bool PRVerifier(const Graph &g, const pvector<ScoreT> &scores,
+bool PRVerifier(const Network &g, const pvector<ScoreT> &scores,
                         double target_error) {
   const ScoreT base_score = (1.0f - kDamp) / g.num_nodes();
   pvector<ScoreT> incomming_sums(g.num_nodes(), 0);
@@ -99,11 +137,11 @@ int main(int argc, char* argv[]) {
   if (!cli.ParseArgs())
     return -1;
   Builder b(cli);
-  Graph g = b.MakeGraph();
-  auto PRBound = [&cli] (const Graph &g) {
+  Network g = b.MakeGraph();
+  auto PRBound = [&cli] (const Network &g) {
     return PageRankPull(g, cli.max_iters(), cli.tolerance());
   };
-  auto VerifierBound = [&cli] (const Graph &g, const pvector<ScoreT> &scores) {
+  auto VerifierBound = [&cli] (const Network &g, const pvector<ScoreT> &scores) {
     return PRVerifier(g, scores, cli.tolerance());
   };
   BenchmarkKernel(cli, g, PRBound, PrintTopScores, VerifierBound);
