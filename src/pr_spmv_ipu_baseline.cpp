@@ -4,9 +4,28 @@
 #include <vector>
 
 // Graphcore Poplar headers
+#include <poplar/IPUModel.hpp>
 #include <poplar/DeviceManager.hpp>
 #include <poplar/Engine.hpp>
 #include <poputil/TileMapping.hpp>
+#include <popops/Loop.hpp>
+#include <poplar/Graph.hpp>
+#include <poplar/IPUModel.hpp>
+#include <poplin/MatMul.hpp>
+#include <poplin/codelets.hpp>
+#include <popops/Cast.hpp>
+#include <popops/codelets.hpp>
+#include <popops/ElementWise.hpp>
+#include <popops/Reduce.hpp>
+#include <popops/AllTrue.hpp>
+#include <popsparse/MatMul.hpp>
+#include <popsparse/MatMulParams.hpp>
+#include <popsparse/SparsePartitioner.hpp>
+#include <popsparse/SparseStorageFormats.hpp>
+#include <popsparse/codelets.hpp>
+#include <poputil/VertexTemplates.hpp>
+#include <poprand/RandomGen.hpp>
+#include <poprand/codelets.hpp>
 
 // GAP Benchmark Suite's headers
 #include "benchmark.h"
@@ -28,6 +47,10 @@ Will return pagerank scores for all vertices once total change < epsilon
 
 
 using namespace std;
+using namespace poplar;
+using namespace poplar::program;
+using namespace popops;
+
 
 typedef float ScoreT;
 const float kDamp = 0.85;
@@ -41,7 +64,7 @@ pvector<ScoreT> PageRankPull(const Network &g, int max_iters,
   vector<vector<float>> L(g.num_nodes(), vector<float>(g.num_nodes(), 0));
 
   for (int64_t i = 0; i < g.num_nodes(); i++) {
-    for (int64_t j = 0; j < g.num_nodes(); j++){
+    for(auto j : g.in_neigh(i)) {
       L[i][j] = 1.0f / g.out_degree(j);
     }
   }
@@ -51,7 +74,7 @@ pvector<ScoreT> PageRankPull(const Network &g, int max_iters,
     pvector<ScoreT> temp(g.num_nodes(), 0);
     for(int64_t i = 0; i < g.num_nodes(); i++) {
       temp[i] = 0;
-      for(auto j : g.in_neigh(i)) {
+      for (int64_t j = 0; j < g.num_nodes(); j++){
         temp[i] += (r[j]* L[i][j]);
       }
       temp[i] = kDamp * temp[i] + base_score;
@@ -70,58 +93,17 @@ pvector<ScoreT> PageRankPull(const Network &g, int max_iters,
 }
 
 
-// This function returns a device side program that will multiply
-// the data in the 2-d tensor 'matrix' with the 1-d vector held
-// in the 'in' tensor. When the program executes
-// the result is placed in the 'out' 1-d tensor.
-Program buildPrProgram(Graph &graph, Tensor matrix, Tensor in,
-                             Tensor out) {
-  // Create a compute set to hold the vertices to perform the calculation
-  ComputeSet mulCS = graph.addComputeSet("mulCS");
-
-  // The compute set holds a vertex for every output value. Each vertex
-  // takes a row of the matrix as input and the whole input vector and
-  // performs a dot-product placing the result in an element of the
-  // output vector.
-  auto numRows = matrix.dim(0);
-
-  for (int iter=0; iter < max_iters; iter++) {
-    auto error = 0;
-    for (unsigned i = 0; i < numRows; ++i)
-        auto temp = 
-    for (unsigned i = 0; i < numRows; ++i) {
-        auto v = graph.addVertex(mulCS,             // Put the vertex in the
-                                                    // 'mulCS' compute set.
-                                "DotProductVertex", // Create a vertex of this
-                                                    // type.
-                                {{"a", matrix[i]},  // Connect input 'a' of the
-                                                    // vertex to a row of the
-                                                    // matrix.
-                                {"b", in},         // Connect input 'b' of the
-                                                    // vertex to whole
-                                                    // input vector.
-                                {"out", out[i]}}); // Connect the output 'out'
-                                                    // of the vertex to a single
-                                                    // element of the output
-                                                    // vector.
-        graph.setTileMapping(v, i);
-    }
-  }
-  // The returned program just executes the 'mulCS' compute set that is,
-  // executes every vertex calculation in parallel.
-  return Execute(mulCS);
-}
-
 
 pvector<ScoreT> PageRankPull_ipu(const Network &g, int max_iters,
-                             double epsilon = 0) {
+                             double epsilon = 0.0) {
 
   unsigned numRows = g.num_nodes();
   unsigned numCols = g.num_nodes();
 
   pvector<ScoreT> r(g.num_nodes());
+  float base_score = (1.0f - kDamp) / g.num_nodes();
 
-  // Create the DeviceManager which is used to discover devices
+    // Create the DeviceManager which is used to discover devices
   auto manager = DeviceManager::createDeviceManager();
 
   // Attempt to attach to a single IPU:
@@ -131,7 +113,7 @@ pvector<ScoreT> PageRankPull_ipu(const Network &g, int max_iters,
 
   if (it == devices.end()) {
     std::cerr << "Error attaching to device\n";
-    return 1; // EXIT_FAILURE
+    return r; // EXIT_FAILURE
   }
 
   auto device = std::move(*it);
@@ -139,45 +121,120 @@ pvector<ScoreT> PageRankPull_ipu(const Network &g, int max_iters,
 
   auto target = device.getTarget();
 
-  std::cout << "Creating environment (compiling vertex programs)\n";
-
-  Graph graph(target);
-  graph.addCodelets("matrix-mul-codelets_baseline.cpp");
-
+  poplar::Graph graph(target);
+  popops::addCodelets(graph);
+  poplin::addCodelets(graph);
+  poprand::addCodelets(graph);
   std::cout << "Constructing compute graph and control program\n";
-
-  // Create tensors in the graph to hold the input/output data.
-  Tensor matrix = graph.addVariable(FLOAT, {numRows, numCols}, "matrix");
-  Tensor inputVector = graph.addVariable(FLOAT, {numCols}, "inputVector");
-  Tensor outputVector = graph.addVariable(FLOAT, {numRows}, "outputVector");
-  poputil::mapTensorLinearly(graph, matrix);
-  poputil::mapTensorLinearly(graph, inputVector);
-  poputil::mapTensorLinearly(graph, outputVector);
 
   // Create host buffers for the inputs and outputs and fill the inputs
   // with sample data.
-  auto hMatrix = std::vector<float>(numRows * numCols);
-  auto hInput = std::vector<float>(numCols);
+  auto hMatrix = std::vector<float>(numRows * numCols, 0);
+  auto hInput = std::vector<float>(numCols, 1.0f / g.num_nodes());
+  auto hDamp = std::vector<float>(numCols, kDamp);
+  auto hBase = std::vector<float>(numCols, base_score);
   auto hOutput = std::vector<float>(numRows);
 
-  for (unsigned j = 0; j < numCols; j++) {
-    hInput[j] = 1.0f / g.num_nodes();
-    for (unsigned i = 0; i < numRows; i++) {
+  for (unsigned i = 0; i < numRows; i++) {
+    for(auto j : g.in_neigh(i)) {
       hMatrix[i * numCols + j] = 1.0f / g.out_degree(j);
     }
   }
 
-  // Create a device program to multiply two tensors together.
-  auto prKernel = buildPrProgram(graph, matrix, inputVector, outputVector);
-
   // Set up data streams to copy data in and out of graph
   auto inStreamV = graph.addHostToDeviceFIFO("inputVector", FLOAT, numCols);
   auto inStreamM = graph.addHostToDeviceFIFO("inputMatrix", FLOAT, numCols * numRows);
+  auto inStreamD = graph.addHostToDeviceFIFO("dampVector", FLOAT, numCols);
+  auto inStreamB = graph.addHostToDeviceFIFO("baseVector", FLOAT, numCols);
   auto outStream = graph.addDeviceToHostFIFO("out", FLOAT, numRows);
 
-  // Create a program that copies data from the host buffers, multiplies
-  // the result and copies the result back to the host.
-  auto prog = Sequence({Copy(inStreamV, inputVector), Copy(inStreamM, matrix), prKernel, Copy(outputVector, outStream)});
+  // IPUModel ipuModel;
+  // Device device = ipuModel.createDevice();
+  // Target target = device.getTarget();
+
+  std::cout << "Creating environment (compiling vertex programs)\n";
+
+
+  // auto outStreamM = graph.addDeviceToHostFIFO("outputMatrix", FLOAT, numCols * numRows);
+
+  /*  To Print the input matrix
+  // for (size_t i = 0; i < numRows; i++) {
+  //   for (size_t j = 0; j < numCols; j++) {
+  //     std::cout << hMatrix[i * numCols + j] << " ";
+  //   }
+  //   std::cout << endl;
+  // }
+  */
+
+  // Create a control program that is a sequence of steps
+  auto mainProg = Sequence();
+  
+  Sequence mul;
+  
+  // Prepare LHS and RHS
+  Tensor matrix = poplin::createMatMulInputLHS(graph, FLOAT, {numRows, numCols}, {numRows, 1}, "A");
+  Tensor score = poplin::createMatMulInputRHS(graph, FLOAT, {numRows, numCols}, {numRows, 1}, "B");
+
+  // matrix = poprand::uniform(graph, NULL, 0, matrix, FLOAT, 0., 1., mul, "randA");
+  // score = poprand::uniform(graph, NULL, 0, score, FLOAT, 0., 1., mul, "randB");
+
+  // Copy data from stream to input tensors
+  mainProg.add(Copy(inStreamV, score)); 
+  mainProg.add(Copy(inStreamM, matrix));
+  
+  // Do the matrix multiplication
+  Tensor output = poplin::matMul(graph, matrix, score, mul, FLOAT, "C");
+
+  popops::mulInPlace(graph, output, kDamp, mul, "Damp");
+  popops::addInPlace(graph, output, base_score, mul, "Base");
+
+  // Print the tensors 
+  mul.add(PrintTensor("matrix", matrix));
+  mul.add(PrintTensor("score", score));
+  mul.add(PrintTensor("output", output));
+
+  // // Elementwise subtraction between score and output
+  // Tensor error = popops::sub(graph, score, output, mul, "Sub");
+  // mul.add(PrintTensor("error", error));
+
+  // // fabs(error) to get absolute error
+  // popops::absInPlace(graph, error, mul, "Abs");
+  // mul.add(PrintTensor("abserror", error));
+
+  // // reduce to get total error
+  // Tensor e = popops::reduce(graph, error, FLOAT, {0}, popops::Operation::ADD, mul, "Red");
+  
+  // Tensor eps = graph.addConstant<float>(FLOAT, {1}, {0.0});
+  // graph.setTileMapping(eps, graph.getTileMapping(e));
+
+  // Tensor iters = graph.addConstant<float>(FLOAT, {1}, {0.0});
+  // graph.setTileMapping(iters, graph.getTileMapping(e));
+  // popops::addInPlace(graph, iters, 1.0, mul, "Iteration");
+  // Tensor finalIteration = eq(graph, iters, (float)max_iters, mul, "FinalIter");
+
+  // auto condProg = Sequence();
+  // // bool of lteq between 0 and error
+  // Tensor neZero = lteq(graph, e, eps, condProg);
+  // mul.add(PrintTensor("totalerror", e));
+  // mul.add(PrintTensor("nezero", neZero));
+
+  // // Tensor terminate = popops::logicalOr(graph, neZero, finalIteration, condProg, "Terminate");
+  // // check if neZero is true
+  // auto predicate = allTrue(graph, neZero, condProg, "all_true");
+  // mul.add(PrintTensor("condition", predicate));
+
+  // copy output to input (score) of next iteration
+  mul.add(Copy(output, score));
+
+
+  // Repeat based on predicate
+  // mainProg.add(RepeatWhileTrue(condProg, predicate, mul));
+
+  // Repeat max_iters number of times
+  mainProg.add(Repeat(max_iters, mul));
+
+  // run mainProg and copy output to outstream
+  auto prog = Sequence({mainProg, Copy(output, outStream)});  //, Copy(matrix, outStreamM)});
                         
 
   // Create an engine from the compute graph and control program.
@@ -186,10 +243,18 @@ pvector<ScoreT> PageRankPull_ipu(const Network &g, int max_iters,
   engine.connectStream("inputVector", hInput.data());
   engine.connectStream("inputMatrix", hMatrix.data());
   engine.connectStream("out", hOutput.data());
+  // engine.connectStream("outputMatrix", hMatrix.data());
 
   // Execute the program
   std::cout << "Running graph program to multiply matrix by vector\n";
   engine.run();
+
+  for (size_t i = 0; i < g.num_nodes(); i++) {
+    r[i] = (ScoreT)hOutput[i];
+    // std::cout << r[i] << ' ';
+  }
+
+  return r;
 
 }
 
@@ -236,16 +301,16 @@ int main(int argc, char* argv[]) {
   Network g = b.MakeGraph();
 
 
-
+  pvector<ScoreT> s = PageRankPull_ipu(g, cli.max_iters(), cli.tolerance());
   
 
-  auto PRBound = [&cli] (const Network &g) {
-    return PageRankPull(g, cli.max_iters(), cli.tolerance());
-  };
-  auto VerifierBound = [&cli] (const Network &g, const pvector<ScoreT> &scores) {
-    return PRVerifier(g, scores, cli.tolerance());
-  };
-  BenchmarkKernel(cli, g, PRBound, PrintTopScores, VerifierBound);
+  // auto PRBound = [&cli] (const Network &g) {
+  //   return PageRankPull_ipu(g, cli.max_iters(), cli.tolerance());
+  // };
+  // auto VerifierBound = [&cli] (const Network &g, const pvector<ScoreT> &scores) {
+  //   return PRVerifier(g, scores, cli.tolerance());
+  // };
+  // BenchmarkKernel(cli, g, PRBound, PrintTopScores, VerifierBound);
   return 0;
 }
 

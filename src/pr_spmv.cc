@@ -69,17 +69,25 @@ pvector<ScoreT> PageRankPull(const Network &g, int max_iters,
   vector<vector<float>> L(g.num_nodes(), vector<float>(g.num_nodes(), 0));
 
   for (int64_t i = 0; i < g.num_nodes(); i++) {
-    for (int64_t j = 0; j < g.num_nodes(); j++){
+    for(auto j : g.in_neigh(i)) {
       L[i][j] = 1.0f / g.out_degree(j);
     }
   }
+
+  /* Print L for debug purposes */
+  // for (int64_t i = 0; i < g.num_nodes(); i++) {
+  //   for (int64_t j = 0; j < g.num_nodes(); j++){ 
+  //           cout << L[i][j] << " ";
+  //   }
+  //   cout << endl;      
+  // }
 
   for (int iter=0; iter < max_iters; iter++) {
     double error = 0;
     pvector<ScoreT> temp(g.num_nodes(), 0);
     for(int64_t i = 0; i < g.num_nodes(); i++) {
       temp[i] = 0;
-      for(auto j : g.in_neigh(i)) {
+      for (int64_t j = 0; j < g.num_nodes(); j++){
         temp[i] += (r[j]* L[i][j]);
       }
       temp[i] = kDamp * temp[i] + base_score;
