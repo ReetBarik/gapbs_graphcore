@@ -97,6 +97,7 @@ pvector<ScoreT> PageRankPull(const Network &g, int max_iters,
 pvector<ScoreT> PageRankPull_ipu(const Network &g, int max_iters,
                              double epsilon = 0.0) {
 
+  std::cout << "Max Iters:" << max_iters << "\n";
   unsigned numRows = g.num_nodes();
   unsigned numCols = g.num_nodes();
 
@@ -107,7 +108,7 @@ pvector<ScoreT> PageRankPull_ipu(const Network &g, int max_iters,
   auto manager = DeviceManager::createDeviceManager();
 
   // Attempt to attach to a single IPU:
-  auto devices = manager.getDevices(poplar::TargetType::IPU, 1);
+  auto devices = manager.getDevices(poplar::TargetType::IPU, 4);
   std::cout << "Trying to attach to IPU\n";
   auto it = std::find_if(devices.begin(), devices.end(), [](Device &device) { return device.attach(); });
 
@@ -193,45 +194,59 @@ pvector<ScoreT> PageRankPull_ipu(const Network &g, int max_iters,
   mul.add(PrintTensor("score", score));
   mul.add(PrintTensor("output", output));
 
-  // // Elementwise subtraction between score and output
-  // Tensor error = popops::sub(graph, score, output, mul, "Sub");
-  // mul.add(PrintTensor("error", error));
-
-  // // fabs(error) to get absolute error
-  // popops::absInPlace(graph, error, mul, "Abs");
-  // mul.add(PrintTensor("abserror", error));
-
-  // // reduce to get total error
-  // Tensor e = popops::reduce(graph, error, FLOAT, {0}, popops::Operation::ADD, mul, "Red");
-  
-  // Tensor eps = graph.addConstant<float>(FLOAT, {1}, {0.0});
-  // graph.setTileMapping(eps, graph.getTileMapping(e));
-
-  // Tensor iters = graph.addConstant<float>(FLOAT, {1}, {0.0});
-  // graph.setTileMapping(iters, graph.getTileMapping(e));
-  // popops::addInPlace(graph, iters, 1.0, mul, "Iteration");
-  // Tensor finalIteration = eq(graph, iters, (float)max_iters, mul, "FinalIter");
-
-  // auto condProg = Sequence();
-  // // bool of lteq between 0 and error
-  // Tensor neZero = lteq(graph, e, eps, condProg);
-  // mul.add(PrintTensor("totalerror", e));
-  // mul.add(PrintTensor("nezero", neZero));
-
-  // // Tensor terminate = popops::logicalOr(graph, neZero, finalIteration, condProg, "Terminate");
-  // // check if neZero is true
-  // auto predicate = allTrue(graph, neZero, condProg, "all_true");
-  // mul.add(PrintTensor("condition", predicate));
+  // Elementwise subtraction between score and output
+  Tensor error = popops::sub(graph, score, output, mul, "Sub");
+  mul.add(PrintTensor("error", error));
 
   // copy output to input (score) of next iteration
   mul.add(Copy(output, score));
 
+  // fabs(error) to get absolute error
+  popops::absInPlace(graph, error, mul, "Abs");
+  mul.add(PrintTensor("abserror", error));
+
+  // auto condProg = Sequence();
+  // reduce to get total error
+  Tensor e = popops::reduce(graph, error, FLOAT, {0}, popops::Operation::ADD, mul, "Red");
+  
+  Tensor eps = graph.addConstant<float>(FLOAT, {1}, {(float)epsilon});
+  graph.setTileMapping(eps, graph.getTileMapping(e));
+
+  Tensor i = graph.addConstant<int>(INT, {1}, {0});
+  graph.setTileMapping(i, graph.getTileMapping(e));
+
+  Tensor max = graph.addConstant<int>(INT, {1}, {max_iters});
+  graph.setTileMapping(max, graph.getTileMapping(e));
+
+  Tensor iters = graph.addVariable(INT, {1}, "Iterations");
+  graph.setTileMapping(iters, graph.getTileMapping(e));
+  
+  mainProg.add(Copy(i, iters));
+  
+  popops::addInPlace(graph, iters, 1, mul, "IterationIncrement");
+  Tensor finalIteration = lteq(graph, iters, max, mul, "FinalIter");
+
+  
+  // bool of gteq between 0 and error
+  Tensor neZero = gteq(graph, e, eps, mul);
+
+  mul.add(PrintTensor("totalerror", e));
+  mul.add(PrintTensor("nezero", neZero));
+  mul.add(PrintTensor("finalIteration", finalIteration));
+  mul.add(PrintTensor("iteration", iters));
+  mul.add(PrintTensor("maxiteration", max));
+
+
+  Tensor doNotTerminate = popops::logicalAnd(graph, neZero, finalIteration, mul, "Terminate");
+  mul.add(PrintTensor("terminate", doNotTerminate));
+  auto predicate = allTrue(graph, doNotTerminate, mul, "all_true");
+  mul.add(PrintTensor("condition", predicate));
 
   // Repeat based on predicate
-  // mainProg.add(RepeatWhileTrue(condProg, predicate, mul));
+  mainProg.add(RepeatWhileTrue(mul, predicate, mul));
 
-  // Repeat max_iters number of times
-  mainProg.add(Repeat(max_iters, mul));
+  // // Repeat max_iters number of times
+  // mainProg.add(Repeat(max_iters, mul));
 
   // run mainProg and copy output to outstream
   auto prog = Sequence({mainProg, Copy(output, outStream)});  //, Copy(matrix, outStreamM)});
@@ -301,16 +316,16 @@ int main(int argc, char* argv[]) {
   Network g = b.MakeGraph();
 
 
-  pvector<ScoreT> s = PageRankPull_ipu(g, cli.max_iters(), cli.tolerance());
+  // pvector<ScoreT> s = PageRankPull_ipu(g, cli.max_iters(), cli.tolerance());
   
 
-  // auto PRBound = [&cli] (const Network &g) {
-  //   return PageRankPull_ipu(g, cli.max_iters(), cli.tolerance());
-  // };
-  // auto VerifierBound = [&cli] (const Network &g, const pvector<ScoreT> &scores) {
-  //   return PRVerifier(g, scores, cli.tolerance());
-  // };
-  // BenchmarkKernel(cli, g, PRBound, PrintTopScores, VerifierBound);
+  auto PRBound = [&cli] (const Network &g) {
+    return PageRankPull_ipu(g, cli.max_iters(), cli.tolerance());
+  };
+  auto VerifierBound = [&cli] (const Network &g, const pvector<ScoreT> &scores) {
+    return PRVerifier(g, scores, cli.tolerance());
+  };
+  BenchmarkKernel(cli, g, PRBound, PrintTopScores, VerifierBound);
   return 0;
 }
 
