@@ -7,6 +7,7 @@
 #include <poplar/IPUModel.hpp>
 #include <poplar/DeviceManager.hpp>
 #include <poplar/Engine.hpp>
+#include <poplar/CycleCount.hpp>
 #include <poputil/TileMapping.hpp>
 #include <popops/Loop.hpp>
 #include <poplar/Graph.hpp>
@@ -108,7 +109,7 @@ pvector<ScoreT> PageRankPull_ipu(const Network &g, int max_iters,
   auto manager = DeviceManager::createDeviceManager();
 
   // Attempt to attach to a single IPU:
-  auto devices = manager.getDevices(poplar::TargetType::IPU, 4);
+  auto devices = manager.getDevices(poplar::TargetType::IPU, 1);
   std::cout << "Trying to attach to IPU\n";
   auto it = std::find_if(devices.begin(), devices.end(), [](Device &device) { return device.attach(); });
 
@@ -176,6 +177,9 @@ pvector<ScoreT> PageRankPull_ipu(const Network &g, int max_iters,
   Tensor matrix = poplin::createMatMulInputLHS(graph, FLOAT, {numRows, numCols}, {numRows, 1}, "A");
   Tensor score = poplin::createMatMulInputRHS(graph, FLOAT, {numRows, numCols}, {numRows, 1}, "B");
 
+  Tensor score_temp = graph.addVariable(FLOAT, {numRows}, "Iterations");
+  graph.setTileMapping(score_temp, graph.getTileMapping(score));
+
   // matrix = poprand::uniform(graph, NULL, 0, matrix, FLOAT, 0., 1., mul, "randA");
   // score = poprand::uniform(graph, NULL, 0, score, FLOAT, 0., 1., mul, "randB");
 
@@ -186,24 +190,26 @@ pvector<ScoreT> PageRankPull_ipu(const Network &g, int max_iters,
   // Do the matrix multiplication
   Tensor output = poplin::matMul(graph, matrix, score, mul, FLOAT, "C");
 
+  mul.add(Copy(score, score_temp));
+
   popops::mulInPlace(graph, output, kDamp, mul, "Damp");
   popops::addInPlace(graph, output, base_score, mul, "Base");
 
   // Print the tensors 
-  mul.add(PrintTensor("matrix", matrix));
-  mul.add(PrintTensor("score", score));
-  mul.add(PrintTensor("output", output));
+  // mul.add(PrintTensor("matrix", matrix));
+  // mul.add(PrintTensor("score", score));
+  // mul.add(PrintTensor("output", output));
 
   // Elementwise subtraction between score and output
   Tensor error = popops::sub(graph, score, output, mul, "Sub");
-  mul.add(PrintTensor("error", error));
+  // mul.add(PrintTensor("error", error));
 
   // copy output to input (score) of next iteration
   mul.add(Copy(output, score));
 
   // fabs(error) to get absolute error
   popops::absInPlace(graph, error, mul, "Abs");
-  mul.add(PrintTensor("abserror", error));
+  // mul.add(PrintTensor("abserror", error));
 
   // auto condProg = Sequence();
   // reduce to get total error
@@ -230,30 +236,34 @@ pvector<ScoreT> PageRankPull_ipu(const Network &g, int max_iters,
   // bool of gteq between 0 and error
   Tensor neZero = gteq(graph, e, eps, mul);
 
-  mul.add(PrintTensor("totalerror", e));
-  mul.add(PrintTensor("nezero", neZero));
-  mul.add(PrintTensor("finalIteration", finalIteration));
-  mul.add(PrintTensor("iteration", iters));
-  mul.add(PrintTensor("maxiteration", max));
+  // mul.add(PrintTensor("totalerror", e));
+  // mul.add(PrintTensor("nezero", neZero));
+  // mul.add(PrintTensor("finalIteration", finalIteration));
+  // mul.add(PrintTensor("iteration", iters));
+  // mul.add(PrintTensor("maxiteration", max));
 
 
   Tensor doNotTerminate = popops::logicalAnd(graph, neZero, finalIteration, mul, "Terminate");
-  mul.add(PrintTensor("terminate", doNotTerminate));
+  // mul.add(PrintTensor("terminate", doNotTerminate));
   auto predicate = allTrue(graph, doNotTerminate, mul, "all_true");
-  mul.add(PrintTensor("condition", predicate));
+  // mul.add(PrintTensor("condition", predicate));
+
+  auto cycles = cycleCount(graph, mul, 0, SyncType::INTERNAL, "totalCycles");
+  graph.createHostRead("cycles", cycles);
 
   // Repeat based on predicate
-  mainProg.add(RepeatWhileTrue(mul, predicate, mul));
+  mainProg.add(Repeat(1, Sequence({RepeatWhileTrue(mul, predicate, mul), Copy(score_temp, score)})));
 
   // // Repeat max_iters number of times
   // mainProg.add(Repeat(max_iters, mul));
 
   // run mainProg and copy output to outstream
-  auto prog = Sequence({mainProg, Copy(output, outStream)});  //, Copy(matrix, outStreamM)});
+  mainProg.add(Copy(output, outStream));
+  // auto prog = Sequence({mainProg, Copy(output, outStream)});  //, Copy(matrix, outStreamM)});
                         
 
   // Create an engine from the compute graph and control program.
-  Engine engine(graph, prog);
+  Engine engine(graph, mainProg);
   engine.load(device);
   engine.connectStream("inputVector", hInput.data());
   engine.connectStream("inputMatrix", hMatrix.data());
@@ -268,6 +278,14 @@ pvector<ScoreT> PageRankPull_ipu(const Network &g, int max_iters,
     r[i] = (ScoreT)hOutput[i];
     // std::cout << r[i] << ' ';
   }
+
+  std::uint64_t cyclesBuffer;
+  engine.readTensor("cycles", &cyclesBuffer, &cyclesBuffer + 1);
+  constexpr double freqGHz = 1.85;
+  double tFlops =
+      2 * g.num_edges() * g.num_nodes() * freqGHz * 1.0e9 / cyclesBuffer;
+  std::cerr << "Total cycles: " << cyclesBuffer << std::endl;
+  std::cerr << "TFlops/sec @" << freqGHz << "GHz = " << tFlops << std::endl;;
 
   return r;
 

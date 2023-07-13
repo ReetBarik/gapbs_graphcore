@@ -17,6 +17,35 @@
 #include "graph.h"
 #include "pvector.h"
 
+// Graphcore Poplar headers
+#include <poplar/IPUModel.hpp>
+#include <poplar/DeviceManager.hpp>
+#include <poplar/Engine.hpp>
+#include <poplar/CycleCount.hpp>
+#include <poputil/TileMapping.hpp>
+#include <popops/Loop.hpp>
+#include <poplar/Graph.hpp>
+#include <poplar/IPUModel.hpp>
+#include <poplin/MatMul.hpp>
+#include <poplin/codelets.hpp>
+#include <poplin/TriangularSolve.hpp>
+#include <popops/Cast.hpp>
+#include <popops/codelets.hpp>
+#include <popops/ElementWise.hpp>
+#include <popops/Reduce.hpp>
+#include <popops/AllTrue.hpp>
+#include <popsparse/MatMul.hpp>
+#include <popsparse/MatMulParams.hpp>
+#include <popsparse/SparsePartitioner.hpp>
+#include <popsparse/SparseStorageFormats.hpp>
+#include <popsparse/codelets.hpp>
+#include <poputil/VertexTemplates.hpp>
+#include <poprand/RandomGen.hpp>
+#include <poprand/codelets.hpp>
+
+
+// To avoid confusion between Poplar Graph and GAP's input Graph
+typedef CSRGraph<NodeID> Network;
 
 /*
 GAP Benchmark Suite
@@ -48,8 +77,11 @@ to relabel the graph, we use the heuristic in WorthRelabelling.
 
 
 using namespace std;
+using namespace poplar;
+using namespace poplar::program;
+using namespace popops;
 
-size_t OrderedCount(const Graph &g) {
+size_t OrderedCount(const Network &g) {
   size_t total = 0;
   #pragma omp parallel for reduction(+ : total) schedule(dynamic, 64)
   for (NodeID u=0; u < g.num_nodes(); u++) {
@@ -72,11 +104,11 @@ size_t OrderedCount(const Graph &g) {
 
 
 // heuristic to see if sufficently dense power-law graph
-bool WorthRelabelling(const Graph &g) {
+bool WorthRelabelling(const Network &g) {
   int64_t average_degree = g.num_edges() / g.num_nodes();
   if (average_degree < 10)
     return false;
-  SourcePicker<Graph> sp(g);
+  SourcePicker<Network> sp(g);
   int64_t num_samples = min(int64_t(1000), g.num_nodes());
   int64_t sample_total = 0;
   pvector<int64_t> samples(num_samples);
@@ -92,21 +124,176 @@ bool WorthRelabelling(const Graph &g) {
 
 
 // uses heuristic to see if worth relabeling
-size_t Hybrid(const Graph &g) {
+size_t Hybrid(const Network &g) {
   if (WorthRelabelling(g))
     return OrderedCount(Builder::RelabelByDegree(g));
   else
     return OrderedCount(g);
 }
 
+size_t Hybrid_LA(const Network &g) {
+  
+  vector<vector<int>> A(g.num_nodes(), vector<int>(g.num_nodes(), 0));
+  vector<vector<int>> L(g.num_nodes(), vector<int>(g.num_nodes(), 0));
+  vector<vector<int>> U(g.num_nodes(), vector<int>(g.num_nodes(), 0));
+  vector<vector<int>> B(g.num_nodes(), vector<int>(g.num_nodes(), 0));
+  int sum = 0;
 
-void PrintTriangleStats(const Graph &g, size_t total_triangles) {
+  for (size_t i = 0; i < g.num_nodes(); i++) {
+    for (auto j : g.out_neigh(i)) {
+      A[i][j] = 1;
+      if (i <= j)
+        U[i][j] = 1;
+      else
+        L[i][j] = 1;
+    }
+  }
+
+  for (size_t i = 0; i < g.num_nodes(); i++) {
+    for (size_t j = 0; j < g.num_nodes(); j++) {
+      for (size_t k = 0; k < g.num_nodes(); k++) {
+        B[i][j] += L[i][k] * U[k][j];
+      }
+    }
+  }
+
+  for (size_t i = 0; i < g.num_nodes(); i++) {
+    for (size_t j = 0; j < g.num_nodes(); j++) {
+      std::cout << A[i][j] << " ";
+    }
+    std::cout << std::endl;
+  }
+  std::cout << std::endl;
+
+  for (size_t i = 0; i < g.num_nodes(); i++) {
+    for (size_t j = 0; j < g.num_nodes(); j++) {
+      std::cout << L[i][j] << " ";
+    }
+    std::cout << std::endl;
+  }
+  std::cout << std::endl;
+
+  for (size_t i = 0; i < g.num_nodes(); i++) {
+    for (size_t j = 0; j < g.num_nodes(); j++) {
+      std::cout << U[i][j] << " ";
+    }
+    std::cout << std::endl;
+  }
+  std::cout << std::endl;
+
+  for (size_t i = 0; i < g.num_nodes(); i++) {
+    for (size_t j = 0; j < g.num_nodes(); j++) {
+      std::cout << B[i][j] << " ";
+    }
+    std::cout << std::endl;
+  }
+  std::cout << std::endl;
+
+  for (size_t i = 0; i < g.num_nodes(); i++) {
+    for (size_t j = 0; j < g.num_nodes(); j++) {
+      sum += A[i][j] * B[i][j];
+      std::cout << A[i][j] * B[i][j] << " ";
+    }
+    std::cout << std::endl;
+  }
+  std::cout << std::endl;
+
+  return sum / 2;
+       
+}
+
+size_t Hybrid_IPU(const Network &g) {
+
+  unsigned numRows = g.num_nodes();
+  unsigned numCols = g.num_nodes();
+  auto hMatrix = std::vector<float>(numRows * numCols, 0);
+  auto res = std::vector<float>(1, -1);
+
+  // Create the DeviceManager which is used to discover devices
+  auto manager = DeviceManager::createDeviceManager();
+
+  // Attempt to attach to a single IPU:
+  auto devices = manager.getDevices(poplar::TargetType::IPU, 1);
+  std::cout << "Trying to attach to IPU\n";
+  auto it = std::find_if(devices.begin(), devices.end(), [](Device &device) { return device.attach(); });
+
+  if (it == devices.end()) {
+    std::cerr << "Error attaching to device\n";
+    return res[0]; // EXIT_FAILURE
+  }
+
+
+  auto device = std::move(*it);
+  std::cout << "Attached to IPU " << device.getId() << std::endl;
+
+  auto target = device.getTarget();
+
+  poplar::Graph graph(target);
+  popops::addCodelets(graph);
+  poplin::addCodelets(graph);
+  poprand::addCodelets(graph);
+  std::cout << "Constructing compute graph and control program\n";
+
+  auto LH = std::vector<float>(numRows * numCols, 0);
+
+  for (unsigned i = 0; i < numRows; i++) {
+    for (auto j : g.out_neigh(i)) {
+      hMatrix[i * numCols + j] = 1.0;
+      if(i <= j) LH[i * numCols + j] = 1.0;
+    }
+  }
+
+  auto inStreamA = graph.addHostToDeviceFIFO("inputMatrix", FLOAT, numCols * numRows);
+  auto outStream = graph.addDeviceToHostFIFO("out", FLOAT, 1);
+
+  std::cout << "Creating environment (compiling vertex programs)\n";
+
+  auto mainProg = Sequence();
+  
+  Sequence mul;
+  
+  Tensor A = poplin::createMatMulInputLHS(graph, FLOAT, {numRows, numCols}, {numRows, numCols}, "A");
+
+  // Prepare LHS and RHS
+  Tensor L = poplin::createMatMulInputLHS(graph, FLOAT, {numRows, numCols}, {numRows, numCols}, "L");
+  Tensor U = poplin::createMatMulInputRHS(graph, FLOAT, {numRows, numCols}, {numRows, numCols}, "U");
+
+  mainProg.add(Copy(inStreamA, A));
+  mainProg.add(Copy(A, L));
+  mainProg.add(Copy(A, U));
+  L = poplin::triangularMask(graph, A, true, false, mul);
+  U = poplin::triangularMask(graph, A, false, false, mul);
+
+
+  Tensor B = poplin::matMul(graph, L, U, mul, FLOAT, "B");
+
+  popops::mulInPlace(graph, A, B, mul, "ElementWiseMul");
+
+  Tensor result = popops::reduce(graph, A, FLOAT, {0,1}, popops::Operation::ADD, mul, "Reduction");
+
+  mainProg.add(Sequence({mul, Copy(result, outStream)}));
+
+  // Create an engine from the compute graph and control program.
+  Engine engine(graph, mainProg);
+  engine.load(device);
+  engine.connectStream("inputMatrix", hMatrix.data());
+  engine.connectStream("out", res.data());
+
+  // Execute the program
+  std::cout << "Running graph program to multiply matrix by vector\n";
+  engine.run();
+
+  return ((int)res[0]) / 2;
+
+}
+
+void PrintTriangleStats(const Network &g, size_t total_triangles) {
   cout << total_triangles << " triangles" << endl;
 }
 
 
 // Compares with simple serial implementation that uses std::set_intersection
-bool TCVerifier(const Graph &g, size_t test_total) {
+bool TCVerifier(const Network &g, size_t test_total) {
   size_t total = 0;
   vector<NodeID> intersection;
   intersection.reserve(g.num_nodes());
@@ -133,11 +320,11 @@ int main(int argc, char* argv[]) {
   if (!cli.ParseArgs())
     return -1;
   Builder b(cli);
-  Graph g = b.MakeGraph();
+  Network g = b.MakeGraph();
   if (g.directed()) {
     cout << "Input graph is directed but tc requires undirected" << endl;
     return -2;
   }
-  BenchmarkKernel(cli, g, Hybrid, PrintTriangleStats, TCVerifier);
+  BenchmarkKernel(cli, g, Hybrid_IPU, PrintTriangleStats, TCVerifier);
   return 0;
 }
