@@ -10,6 +10,7 @@
 #include <cinttypes>
 #include <iostream>
 #include <vector>
+#include <chrono>
 
 #include "benchmark.h"
 #include "builder.h"
@@ -157,46 +158,46 @@ size_t Hybrid_LA(const Network &g) {
     }
   }
 
-  for (size_t i = 0; i < g.num_nodes(); i++) {
-    for (size_t j = 0; j < g.num_nodes(); j++) {
-      std::cout << A[i][j] << " ";
-    }
-    std::cout << std::endl;
-  }
-  std::cout << std::endl;
+  // for (size_t i = 0; i < g.num_nodes(); i++) {
+  //   for (size_t j = 0; j < g.num_nodes(); j++) {
+  //     std::cout << A[i][j] << " ";
+  //   }
+  //   std::cout << std::endl;
+  // }
+  // std::cout << std::endl;
 
-  for (size_t i = 0; i < g.num_nodes(); i++) {
-    for (size_t j = 0; j < g.num_nodes(); j++) {
-      std::cout << L[i][j] << " ";
-    }
-    std::cout << std::endl;
-  }
-  std::cout << std::endl;
+  // for (size_t i = 0; i < g.num_nodes(); i++) {
+  //   for (size_t j = 0; j < g.num_nodes(); j++) {
+  //     std::cout << L[i][j] << " ";
+  //   }
+  //   std::cout << std::endl;
+  // }
+  // std::cout << std::endl;
 
-  for (size_t i = 0; i < g.num_nodes(); i++) {
-    for (size_t j = 0; j < g.num_nodes(); j++) {
-      std::cout << U[i][j] << " ";
-    }
-    std::cout << std::endl;
-  }
-  std::cout << std::endl;
+  // for (size_t i = 0; i < g.num_nodes(); i++) {
+  //   for (size_t j = 0; j < g.num_nodes(); j++) {
+  //     std::cout << U[i][j] << " ";
+  //   }
+  //   std::cout << std::endl;
+  // }
+  // std::cout << std::endl;
 
-  for (size_t i = 0; i < g.num_nodes(); i++) {
-    for (size_t j = 0; j < g.num_nodes(); j++) {
-      std::cout << B[i][j] << " ";
-    }
-    std::cout << std::endl;
-  }
-  std::cout << std::endl;
+  // for (size_t i = 0; i < g.num_nodes(); i++) {
+  //   for (size_t j = 0; j < g.num_nodes(); j++) {
+  //     std::cout << B[i][j] << " ";
+  //   }
+  //   std::cout << std::endl;
+  // }
+  // std::cout << std::endl;
 
   for (size_t i = 0; i < g.num_nodes(); i++) {
     for (size_t j = 0; j < g.num_nodes(); j++) {
       sum += A[i][j] * B[i][j];
-      std::cout << A[i][j] * B[i][j] << " ";
+      // std::cout << A[i][j] * B[i][j] << " ";
     }
-    std::cout << std::endl;
+    // std::cout << std::endl;
   }
-  std::cout << std::endl;
+  // std::cout << std::endl;
 
   return sum / 2;
        
@@ -264,13 +265,15 @@ size_t Hybrid_IPU(const Network &g) {
   L = poplin::triangularMask(graph, A, true, false, mul);
   U = poplin::triangularMask(graph, A, false, false, mul);
 
-
+  mainProg.add(PrintTensor("A", A));
+  mul.add(PrintTensor("L", L));
+  mul.add(PrintTensor("U", U));
   Tensor B = poplin::matMul(graph, L, U, mul, FLOAT, "B");
-
+  mul.add(PrintTensor("B", B));
   popops::mulInPlace(graph, A, B, mul, "ElementWiseMul");
-
+  mul.add(PrintTensor("Ele_A", A));
   Tensor result = popops::reduce(graph, A, FLOAT, {0,1}, popops::Operation::ADD, mul, "Reduction");
-
+  mul.add(PrintTensor("Res", result));
   mainProg.add(Sequence({mul, Copy(result, outStream)}));
 
   // Create an engine from the compute graph and control program.
@@ -325,6 +328,13 @@ int main(int argc, char* argv[]) {
     cout << "Input graph is directed but tc requires undirected" << endl;
     return -2;
   }
-  BenchmarkKernel(cli, g, Hybrid_IPU, PrintTriangleStats, TCVerifier);
+  auto start = std::chrono::high_resolution_clock::now();
+  size_t r = Hybrid_LA(const Network &g);
+  auto end = std::chrono::high_resolution_clock::now();
+
+  std::chrono::duration<uint64_t, std::chrono::high_resolution_clock::period> elapsed = end - start;
+
+  std::cout << elapsed.count() << " Cycles" << std::endl; 
+  // BenchmarkKernel(cli, g, Hybrid_IPU, PrintTriangleStats, TCVerifier);
   return 0;
 }
