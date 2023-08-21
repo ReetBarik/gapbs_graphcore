@@ -19,30 +19,30 @@
 #include "pvector.h"
 
 // Graphcore Poplar headers
-#include <poplar/IPUModel.hpp>
-#include <poplar/DeviceManager.hpp>
-#include <poplar/Engine.hpp>
-#include <poplar/CycleCount.hpp>
-#include <poputil/TileMapping.hpp>
-#include <popops/Loop.hpp>
-#include <poplar/Graph.hpp>
-#include <poplar/IPUModel.hpp>
-#include <poplin/MatMul.hpp>
-#include <poplin/codelets.hpp>
-#include <poplin/TriangularSolve.hpp>
-#include <popops/Cast.hpp>
-#include <popops/codelets.hpp>
-#include <popops/ElementWise.hpp>
-#include <popops/Reduce.hpp>
-#include <popops/AllTrue.hpp>
-#include <popsparse/MatMul.hpp>
-#include <popsparse/MatMulParams.hpp>
-#include <popsparse/SparsePartitioner.hpp>
-#include <popsparse/SparseStorageFormats.hpp>
-#include <popsparse/codelets.hpp>
-#include <poputil/VertexTemplates.hpp>
-#include <poprand/RandomGen.hpp>
-#include <poprand/codelets.hpp>
+// #include <poplar/IPUModel.hpp>
+// #include <poplar/DeviceManager.hpp>
+// #include <poplar/Engine.hpp>
+// #include <poplar/CycleCount.hpp>
+// #include <poputil/TileMapping.hpp>
+// #include <popops/Loop.hpp>
+// #include <poplar/Graph.hpp>
+// #include <poplar/IPUModel.hpp>
+// #include <poplin/MatMul.hpp>
+// #include <poplin/codelets.hpp>
+// #include <poplin/TriangularSolve.hpp>
+// #include <popops/Cast.hpp>
+// #include <popops/codelets.hpp>
+// #include <popops/ElementWise.hpp>
+// #include <popops/Reduce.hpp>
+// #include <popops/AllTrue.hpp>
+// #include <popsparse/MatMul.hpp>
+// #include <popsparse/MatMulParams.hpp>
+// #include <popsparse/SparsePartitioner.hpp>
+// #include <popsparse/SparseStorageFormats.hpp>
+// #include <popsparse/codelets.hpp>
+// #include <poputil/VertexTemplates.hpp>
+// #include <poprand/RandomGen.hpp>
+// #include <poprand/codelets.hpp>
 
 
 // To avoid confusion between Poplar Graph and GAP's input Graph
@@ -78,9 +78,9 @@ to relabel the graph, we use the heuristic in WorthRelabelling.
 
 
 using namespace std;
-using namespace poplar;
-using namespace poplar::program;
-using namespace popops;
+// using namespace poplar;
+// using namespace poplar::program;
+// using namespace popops;
 
 size_t OrderedCount(const Network &g) {
   size_t total = 0;
@@ -153,7 +153,8 @@ size_t Hybrid_LA(const Network &g) {
   for (size_t i = 0; i < g.num_nodes(); i++) {
     for (size_t j = 0; j < g.num_nodes(); j++) {
       for (size_t k = 0; k < g.num_nodes(); k++) {
-        B[i][j] += L[i][k] * U[k][j];
+        
+          B[i][j] += ((i > k) && (k < j)) ? A[i][k] * A[k][j] : 0;
       }
     }
   }
@@ -203,92 +204,92 @@ size_t Hybrid_LA(const Network &g) {
        
 }
 
-size_t Hybrid_IPU(const Network &g) {
+// size_t Hybrid_IPU(const Network &g) {
 
-  unsigned numRows = g.num_nodes();
-  unsigned numCols = g.num_nodes();
-  auto hMatrix = std::vector<float>(numRows * numCols, 0);
-  auto res = std::vector<float>(1, -1);
+//   unsigned numRows = g.num_nodes();
+//   unsigned numCols = g.num_nodes();
+//   auto hMatrix = std::vector<float>(numRows * numCols, 0);
+//   auto res = std::vector<float>(1, -1);
 
-  // Create the DeviceManager which is used to discover devices
-  auto manager = DeviceManager::createDeviceManager();
+//   // Create the DeviceManager which is used to discover devices
+//   auto manager = DeviceManager::createDeviceManager();
 
-  // Attempt to attach to a single IPU:
-  auto devices = manager.getDevices(poplar::TargetType::IPU, 1);
-  std::cout << "Trying to attach to IPU\n";
-  auto it = std::find_if(devices.begin(), devices.end(), [](Device &device) { return device.attach(); });
+//   // Attempt to attach to a single IPU:
+//   auto devices = manager.getDevices(poplar::TargetType::IPU, 1);
+//   std::cout << "Trying to attach to IPU\n";
+//   auto it = std::find_if(devices.begin(), devices.end(), [](Device &device) { return device.attach(); });
 
-  if (it == devices.end()) {
-    std::cerr << "Error attaching to device\n";
-    return res[0]; // EXIT_FAILURE
-  }
+//   if (it == devices.end()) {
+//     std::cerr << "Error attaching to device\n";
+//     return res[0]; // EXIT_FAILURE
+//   }
 
 
-  auto device = std::move(*it);
-  std::cout << "Attached to IPU " << device.getId() << std::endl;
+//   auto device = std::move(*it);
+//   std::cout << "Attached to IPU " << device.getId() << std::endl;
 
-  auto target = device.getTarget();
+//   auto target = device.getTarget();
 
-  poplar::Graph graph(target);
-  popops::addCodelets(graph);
-  poplin::addCodelets(graph);
-  poprand::addCodelets(graph);
-  std::cout << "Constructing compute graph and control program\n";
+//   poplar::Graph graph(target);
+//   popops::addCodelets(graph);
+//   poplin::addCodelets(graph);
+//   poprand::addCodelets(graph);
+//   std::cout << "Constructing compute graph and control program\n";
 
-  auto LH = std::vector<float>(numRows * numCols, 0);
+//   auto LH = std::vector<float>(numRows * numCols, 0);
 
-  for (unsigned i = 0; i < numRows; i++) {
-    for (auto j : g.out_neigh(i)) {
-      hMatrix[i * numCols + j] = 1.0;
-      if(i <= j) LH[i * numCols + j] = 1.0;
-    }
-  }
+//   for (unsigned i = 0; i < numRows; i++) {
+//     for (auto j : g.out_neigh(i)) {
+//       hMatrix[i * numCols + j] = 1.0;
+//       if(i <= j) LH[i * numCols + j] = 1.0;
+//     }
+//   }
 
-  auto inStreamA = graph.addHostToDeviceFIFO("inputMatrix", FLOAT, numCols * numRows);
-  auto outStream = graph.addDeviceToHostFIFO("out", FLOAT, 1);
+//   auto inStreamA = graph.addHostToDeviceFIFO("inputMatrix", FLOAT, numCols * numRows);
+//   auto outStream = graph.addDeviceToHostFIFO("out", FLOAT, 1);
 
-  std::cout << "Creating environment (compiling vertex programs)\n";
+//   std::cout << "Creating environment (compiling vertex programs)\n";
 
-  auto mainProg = Sequence();
+//   auto mainProg = Sequence();
   
-  Sequence mul;
+//   Sequence mul;
   
-  Tensor A = poplin::createMatMulInputLHS(graph, FLOAT, {numRows, numCols}, {numRows, numCols}, "A");
+//   Tensor A = poplin::createMatMulInputLHS(graph, FLOAT, {numRows, numCols}, {numRows, numCols}, "A");
 
-  // Prepare LHS and RHS
-  Tensor L = poplin::createMatMulInputLHS(graph, FLOAT, {numRows, numCols}, {numRows, numCols}, "L");
-  Tensor U = poplin::createMatMulInputRHS(graph, FLOAT, {numRows, numCols}, {numRows, numCols}, "U");
+//   // Prepare LHS and RHS
+//   Tensor L = poplin::createMatMulInputLHS(graph, FLOAT, {numRows, numCols}, {numRows, numCols}, "L");
+//   Tensor U = poplin::createMatMulInputRHS(graph, FLOAT, {numRows, numCols}, {numRows, numCols}, "U");
 
-  mainProg.add(Copy(inStreamA, A));
-  mainProg.add(Copy(A, L));
-  mainProg.add(Copy(A, U));
-  L = poplin::triangularMask(graph, A, true, false, mul);
-  U = poplin::triangularMask(graph, A, false, false, mul);
+//   mainProg.add(Copy(inStreamA, A));
+//   mainProg.add(Copy(A, L));
+//   mainProg.add(Copy(A, U));
+//   L = poplin::triangularMask(graph, A, true, false, mul);
+//   U = poplin::triangularMask(graph, A, false, false, mul);
 
-  mainProg.add(PrintTensor("A", A));
-  mul.add(PrintTensor("L", L));
-  mul.add(PrintTensor("U", U));
-  Tensor B = poplin::matMul(graph, L, U, mul, FLOAT, "B");
-  mul.add(PrintTensor("B", B));
-  popops::mulInPlace(graph, A, B, mul, "ElementWiseMul");
-  mul.add(PrintTensor("Ele_A", A));
-  Tensor result = popops::reduce(graph, A, FLOAT, {0,1}, popops::Operation::ADD, mul, "Reduction");
-  mul.add(PrintTensor("Res", result));
-  mainProg.add(Sequence({mul, Copy(result, outStream)}));
+//   mainProg.add(PrintTensor("A", A));
+//   mul.add(PrintTensor("L", L));
+//   mul.add(PrintTensor("U", U));
+//   Tensor B = poplin::matMul(graph, L, U, mul, FLOAT, "B");
+//   mul.add(PrintTensor("B", B));
+//   popops::mulInPlace(graph, A, B, mul, "ElementWiseMul");
+//   mul.add(PrintTensor("Ele_A", A));
+//   Tensor result = popops::reduce(graph, A, FLOAT, {0,1}, popops::Operation::ADD, mul, "Reduction");
+//   mul.add(PrintTensor("Res", result));
+//   mainProg.add(Sequence({mul, Copy(result, outStream)}));
 
-  // Create an engine from the compute graph and control program.
-  Engine engine(graph, mainProg);
-  engine.load(device);
-  engine.connectStream("inputMatrix", hMatrix.data());
-  engine.connectStream("out", res.data());
+//   // Create an engine from the compute graph and control program.
+//   Engine engine(graph, mainProg);
+//   engine.load(device);
+//   engine.connectStream("inputMatrix", hMatrix.data());
+//   engine.connectStream("out", res.data());
 
-  // Execute the program
-  std::cout << "Running graph program to multiply matrix by vector\n";
-  engine.run();
+//   // Execute the program
+//   std::cout << "Running graph program to multiply matrix by vector\n";
+//   engine.run();
 
-  return ((int)res[0]) / 2;
+//   return ((int)res[0]) / 2;
 
-}
+// }
 
 void PrintTriangleStats(const Network &g, size_t total_triangles) {
   cout << total_triangles << " triangles" << endl;
@@ -328,13 +329,23 @@ int main(int argc, char* argv[]) {
     cout << "Input graph is directed but tc requires undirected" << endl;
     return -2;
   }
-  auto start = std::chrono::high_resolution_clock::now();
-  size_t r = Hybrid_LA(const Network &g);
-  auto end = std::chrono::high_resolution_clock::now();
 
-  std::chrono::duration<uint64_t, std::chrono::high_resolution_clock::period> elapsed = end - start;
+  size_t max = 0;
+  size_t sum = 0;
+  for (NodeID u : g.vertices()) {
+    size_t degree = 0;
+    for (NodeID v : g.out_neigh(u)) {
+      degree += 1;
+    }
+    sum += degree;
 
-  std::cout << elapsed.count() << " Cycles" << std::endl; 
-  // BenchmarkKernel(cli, g, Hybrid_IPU, PrintTriangleStats, TCVerifier);
+    if (degree > max)
+      max = degree;
+  }
+
+  std::cout << "Max: " << max << std::endl;
+  std::cout << "Avg: " << (float)sum / g.num_nodes() << std::endl;
+
+  BenchmarkKernel(cli, g, Hybrid_LA, PrintTriangleStats, TCVerifier);
   return 0;
 }
